@@ -7,7 +7,6 @@ Each batch has parts arranged in a 2x5 grid with 1.5mm thick connecting runners.
 import trimesh
 import numpy as np
 from pathlib import Path
-import os
 
 # Configuration
 STL_DIR = Path("Adapter STL files")
@@ -16,7 +15,6 @@ RUNNER_THICKNESS = 1.5  # mm - minimum for easy break-off per JLC3DP guidelines
 RUNNER_WIDTH = 2.0  # mm
 PART_SPACING = 5.0  # mm gap between parts
 RUNNER_Z_HEIGHT = 3.0  # mm - place runners on the main body, well above the prongs
-RUNNER_Y_OFFSET = 3.0  # mm - offset runners toward the "top" edge (higher Y) to avoid center indents
 
 # Define all 9 batches
 BATCHES = {
@@ -57,102 +55,31 @@ def load_stl(filename):
     return mesh
 
 
-def find_optimal_attachment_point(mesh):
+def find_attachment_point_local(mesh):
     """
-    Analyze a mesh to find the optimal attachment point for runners.
-    Returns (y_offset, z_height, top_surface_z) relative to the mesh center.
-    
-    Strategy:
-    1. Find flat side faces (normals pointing ±X direction)
-    2. Filter for faces above Z=2mm (on main body, not prongs)
-    3. Select faces on the outer edge (high Y) to avoid center indents
-    4. Find the top surface Z at the attachment Y position
-    5. Return the Y and Z coordinates for attachment, plus top surface Z
+    Find the attachment point for runners in the mesh's LOCAL coordinate frame.
+    Returns (x, y, z) - the absolute position in mesh-local coordinates.
+
+    Strategy: Use simple geometry based on bounding box percentages.
+    - X: center of mesh (runners connect at center X)
+    - Y: 70% from min toward max (toward back edge, away from center indent)
+    - Z: 3mm above mesh bottom (on main body, above the prongs)
     """
-    normals = mesh.face_normals
-    
-    # Find faces with normals pointing in ±X direction (side faces)
-    # We use ±X because runners typically run in the X direction between parts
-    x_faces_mask = np.abs(normals[:, 0]) > 0.85  # Faces pointing mostly in X direction
-    
-    if not x_faces_mask.any():
-        # Fallback to default values if no suitable faces found
-        print("  Warning: No suitable side faces found, using defaults")
-        return (RUNNER_Y_OFFSET, RUNNER_Z_HEIGHT, RUNNER_Z_HEIGHT + 2.0)
-    
-    # Get centroids of these faces
-    x_face_indices = np.where(x_faces_mask)[0]
-    x_face_verts = mesh.vertices[mesh.faces[x_face_indices]]
-    x_face_centroids = x_face_verts.mean(axis=1)
-    
-    # Filter for faces above the prongs (Z > 2.0mm)
-    z_values = x_face_centroids[:, 2]
-    above_prongs_mask = z_values > 2.0
-    
-    if not above_prongs_mask.any():
-        print("  Warning: No faces above prongs, using defaults")
-        return (RUNNER_Y_OFFSET, RUNNER_Z_HEIGHT, RUNNER_Z_HEIGHT + 2.0)
-    
-    # Filter to faces above prongs
-    valid_centroids = x_face_centroids[above_prongs_mask]
-    
-    # Get Y range of the mesh
-    y_min, y_max = mesh.bounds[0][1], mesh.bounds[1][1]
-    y_range = y_max - y_min
-    y_center = (y_max + y_min) / 2
-    
-    # Find faces in the outer 40% of Y range (toward the edge, away from center indent)
-    # We want faces with Y > y_center + 0.2 * y_range
-    y_threshold = y_center + 0.2 * y_range
-    outer_edge_mask = valid_centroids[:, 1] > y_threshold
-    
-    if not outer_edge_mask.any():
-        # If no faces in outer edge, just use the highest Y faces
-        outer_edge_mask = valid_centroids[:, 1] > y_center
-    
-    if outer_edge_mask.any():
-        edge_centroids = valid_centroids[outer_edge_mask]
-        # Use the median Y and Z position of these faces
-        optimal_y = np.median(edge_centroids[:, 1])
-        optimal_z = np.median(edge_centroids[:, 2])
-        
-        # Convert to offset relative to mesh center
-        y_offset = optimal_y - y_center
-        
-        # Now find the MINIMUM top surface Z across the full Y range
-        # This accounts for sloped surfaces and vertical runners between rows
-        # Look for faces with normals pointing upward (+Z direction)
-        z_up_faces_mask = normals[:, 2] > 0.85  # Faces pointing up
-        if z_up_faces_mask.any():
-            z_up_indices = np.where(z_up_faces_mask)[0]
-            z_up_verts = mesh.vertices[mesh.faces[z_up_indices]]
-            z_up_centroids = z_up_verts.mean(axis=1)
-            
-            # Filter for faces in the outer region where runners attach
-            # Use faces with Y > y_center (upper half of the mesh)
-            upper_half_mask = z_up_centroids[:, 1] > y_center
-            if upper_half_mask.any():
-                upper_centroids = z_up_centroids[upper_half_mask]
-                # Use MINIMUM Z of top surface in this region (critical for sloped surfaces)
-                top_surface_z = np.min(upper_centroids[:, 2])
-            else:
-                # No top faces in upper half, use attachment Y area
-                y_near_mask = np.abs(z_up_centroids[:, 1] - optimal_y) < 2.0
-                if y_near_mask.any():
-                    near_centroids = z_up_centroids[y_near_mask]
-                    top_surface_z = np.min(near_centroids[:, 2])
-                else:
-                    # Fallback to max Z
-                    top_surface_z = mesh.bounds[1][2]
-        else:
-            # No top faces found, estimate
-            top_surface_z = mesh.bounds[1][2]
-        
-        print(f"  Found attachment point: Y offset = {y_offset:.2f}mm, Z = {optimal_z:.2f}mm, Top surface Z = {top_surface_z:.2f}mm")
-        return (y_offset, optimal_z, top_surface_z)
-    else:
-        print("  Warning: No suitable outer edge faces, using defaults")
-        return (RUNNER_Y_OFFSET, RUNNER_Z_HEIGHT, RUNNER_Z_HEIGHT + 2.0)
+    bounds = mesh.bounds
+    x_min, y_min, z_min = bounds[0]
+    x_max, y_max, z_max = bounds[1]
+
+    # X: center of mesh
+    x_attach = (x_min + x_max) / 2
+
+    # Y: 70% from min toward max (toward "back" edge, away from center indent)
+    y_attach = y_min + 0.7 * (y_max - y_min)
+
+    # Z: fixed height above mesh bottom (on main body, above prongs)
+    # Use RUNNER_Z_HEIGHT as the offset from bottom
+    z_attach = z_min + RUNNER_Z_HEIGHT
+
+    return (x_attach, y_attach, z_attach)
 
 
 def create_runner(start_pos, end_pos, z_level):
@@ -189,137 +116,118 @@ def get_mesh_dimensions(mesh):
     return bounds[1] - bounds[0]  # max - min for each axis
 
 
-def arrange_parts_in_grid(meshes, attachment_offsets, common_z, rows=2, cols=5):
+def arrange_parts_in_grid(meshes, rows=2, cols=5):
     """
-    Arrange meshes in a grid pattern, offsetting each part so its attachment
-    point aligns with the fixed runner grid positions.
-    
+    Arrange meshes in a grid pattern so their attachment points land on a regular grid.
+
+    The attachment point of each mesh is moved to a target grid position using a
+    single translation. This ensures runners connect at consistent positions.
+
     Args:
         meshes: List of meshes to arrange
-        attachment_offsets: List of (y_offset, z_height, top_surface_z) for each mesh
-        common_z: Common Z height for all runners
         rows: Number of rows in grid
         cols: Number of columns in grid
-    
+
     Returns:
         arranged: List of positioned meshes
-        grid_positions: List of (x, y) grid positions where runners connect
+        attachment_positions: List of (x, y, z) final attachment positions for each part
         cell_size: (cell_width, cell_height) tuple
+        common_z: The Z height used for all attachment points
     """
     if len(meshes) > rows * cols:
         raise ValueError(f"Too many meshes ({len(meshes)}) for {rows}x{cols} grid")
-    
+
     # Find the maximum dimensions across all meshes
     max_dims = np.array([0.0, 0.0, 0.0])
     for mesh in meshes:
         dims = get_mesh_dimensions(mesh)
         max_dims = np.maximum(max_dims, dims)
-    
+
     # Cell size includes part spacing
     cell_width = max_dims[0] + PART_SPACING
     cell_height = max_dims[1] + PART_SPACING
-    
-    # Calculate runner top Z
-    runner_top_z = common_z + RUNNER_THICKNESS / 2
-    
+
+    # Use a fixed Z height for all runners (RUNNER_Z_HEIGHT above final mesh bottom)
+    # We'll position parts so their bottoms are at Z=0, then attachment is at RUNNER_Z_HEIGHT
+    common_z = RUNNER_Z_HEIGHT
+
     arranged = []
-    grid_positions = []
-    
+    attachment_positions = []
+
     for i, mesh in enumerate(meshes):
         row = i // cols
         col = i % cols
-        
-        # Calculate grid cell center
-        grid_x = col * cell_width
-        grid_y = row * cell_height
-        
-        # Store the grid position (where runners will connect)
-        grid_positions.append((grid_x, grid_y))
-        
-        # Get attachment offset for this mesh
-        y_offset, z_height, top_surface_z = attachment_offsets[i]
-        
-        # Copy mesh and translate to position
+
+        # Target grid position for attachment point
+        target_x = col * cell_width
+        target_y = row * cell_height
+        target_z = common_z
+
+        # Find attachment point in mesh's local coordinates
+        local_x, local_y, local_z = find_attachment_point_local(mesh)
+
+        # Get mesh bounds for Z floor calculation
+        z_min = mesh.bounds[0][2]
+
+        # Calculate translation:
+        # - X and Y: move local attachment point to target grid position
+        # - Z: place mesh bottom at Z=0, so attachment point (at z_min + RUNNER_Z_HEIGHT)
+        #      ends up at RUNNER_Z_HEIGHT = common_z
+        translation = (
+            target_x - local_x,
+            target_y - local_y,
+            -z_min  # This puts mesh bottom at Z=0, attachment at RUNNER_Z_HEIGHT
+        )
+
+        # Apply single translation
         positioned_mesh = mesh.copy()
-        
-        # First center the mesh at origin
-        centroid = positioned_mesh.bounds.mean(axis=0)
-        positioned_mesh.apply_translation(-centroid)
-        
-        # Calculate Z adjustments:
-        # 1. Base adjustment to align attachment point with common_z
-        z_adjustment = common_z - z_height
-        
-        # 2. Additional adjustment if runner would protrude above top surface
-        # After base adjustment, top surface will be at: top_surface_z + z_adjustment
-        # Runner top is at: runner_top_z
-        # If runner_top_z > (top_surface_z + z_adjustment), push part up
-        adjusted_top_surface = top_surface_z + z_adjustment
-        if runner_top_z > adjusted_top_surface:
-            protrusion = runner_top_z - adjusted_top_surface
-            z_adjustment += protrusion + 0.1  # Add 0.1mm margin
-            print(f"    Part {i}: Pushing up by {protrusion:.2f}mm to clear runner")
-        
-        # Apply all translations
-        positioned_mesh.apply_translation([grid_x, grid_y - y_offset, -positioned_mesh.bounds[0][2] + z_adjustment])
-        
+        positioned_mesh.apply_translation(translation)
+
         arranged.append(positioned_mesh)
-    
-    return arranged, grid_positions, (cell_width, cell_height)
+        attachment_positions.append((target_x, target_y, target_z))
+
+    return arranged, attachment_positions, (cell_width, cell_height), common_z
 
 
-def create_connected_batch(meshes, original_meshes):
+def create_connected_batch(meshes):
     """
     Create a single connected mesh from multiple meshes.
-    Creates a fixed runner grid, then positions parts so their attachment 
-    points align with the grid.
-    
+    Arranges parts in a grid and connects them with runners at their attachment points.
+
     Args:
-        meshes: List of mesh copies to arrange
-        original_meshes: List of original meshes (before positioning) for analysis
+        meshes: List of meshes to arrange and connect
     """
     if len(meshes) == 0:
         raise ValueError("No meshes to combine")
-    
-    # Calculate optimal attachment points for each mesh
-    print("  Analyzing meshes for optimal attachment points...")
-    attachment_points = []
-    for i, orig_mesh in enumerate(original_meshes):
-        y_offset, z_height, top_surface_z = find_optimal_attachment_point(orig_mesh)
-        attachment_points.append((y_offset, z_height, top_surface_z))
-    
-    # Find a common Z height for all runners (use minimum to avoid sticking out)
-    z_heights = [z for _, z, _ in attachment_points]
-    common_z = min(z_heights)
-    print(f"  Using common runner Z height: {common_z:.2f}mm")
-    
-    # Arrange parts in grid, offsetting each part so its attachment aligns with grid
-    arranged, grid_positions, cell_size = arrange_parts_in_grid(meshes, attachment_points, common_z)
-    
-    # Create runners at fixed grid positions
+
+    # Arrange parts in grid - each part's attachment point lands on the grid
+    arranged, attachment_positions, cell_size, common_z = arrange_parts_in_grid(meshes)
+    print(f"  Using runner Z height: {common_z:.2f}mm")
+
+    # Create runners connecting attachment points
     runners = []
     cols = 5
-    
-    for i, grid_pos in enumerate(grid_positions):
+
+    for i, attach_pos in enumerate(attachment_positions):
         row = i // cols
         col = i % cols
-        
+
         # Connect to right neighbor (horizontal runner)
-        if col < cols - 1 and i + 1 < len(grid_positions):
-            next_grid_pos = grid_positions[i + 1]
-            runner = create_runner(grid_pos, next_grid_pos, common_z)
+        if col < cols - 1 and i + 1 < len(attachment_positions):
+            next_attach_pos = attachment_positions[i + 1]
+            runner = create_runner(attach_pos, next_attach_pos, common_z)
             runners.append(runner)
-        
+
         # Connect to bottom neighbor (vertical runner)
-        if row < 1 and i + cols < len(grid_positions):
-            below_grid_pos = grid_positions[i + cols]
-            runner = create_runner(grid_pos, below_grid_pos, common_z)
+        if row < 1 and i + cols < len(attachment_positions):
+            below_attach_pos = attachment_positions[i + cols]
+            runner = create_runner(attach_pos, below_attach_pos, common_z)
             runners.append(runner)
-    
+
     # Combine all meshes and runners
     all_meshes = arranged + runners
     combined = trimesh.util.concatenate(all_meshes)
-    
+
     return combined
 
 
@@ -329,27 +237,25 @@ def process_batch(batch_name, part_specs):
     part_specs is a list of (filename, count) tuples.
     """
     print(f"\nProcessing {batch_name}...")
-    
+
     # Load all required meshes
     meshes = []
-    original_meshes = []  # Keep original copies for analysis
     for filename, count in part_specs:
         print(f"  Loading {count}x {filename}")
         base_mesh = load_stl(filename)
         for _ in range(count):
             meshes.append(base_mesh.copy())
-            original_meshes.append(base_mesh.copy())  # Store original for attachment point analysis
-    
+
     print(f"  Total parts: {len(meshes)}")
-    
-    # Combine meshes using dynamic attachment points
-    combined = create_connected_batch(meshes, original_meshes)
-    
+
+    # Combine meshes with runners
+    combined = create_connected_batch(meshes)
+
     # Save combined mesh
     output_path = OUTPUT_DIR / f"{batch_name}.stl"
     combined.export(str(output_path))
     print(f"  Saved: {output_path}")
-    
+
     return combined
 
 
