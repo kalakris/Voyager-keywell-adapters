@@ -1,0 +1,4 @@
+*.png
+Combined STL files/
+venv/
+.DS_Store
