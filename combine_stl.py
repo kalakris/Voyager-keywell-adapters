@@ -60,23 +60,79 @@ def find_attachment_point_local(mesh):
     Find the attachment point for runners in the mesh's LOCAL coordinate frame.
     Returns (x, y, z) - the absolute position in mesh-local coordinates.
 
-    Strategy: Use simple geometry based on bounding box percentages.
+    Strategy: Find where back face, side faces, AND top surface all exist,
+    so runner doesn't jut out past any face or into indent areas.
     - X: center of mesh (runners connect at center X)
-    - Y: 70% from min toward max (toward back edge, away from center indent)
-    - Z: 3mm above mesh bottom (on main body, above the prongs)
+    - Y: constrained by back face, side face, AND top surface extents
+    - Z: minimum Z of back face above prongs (where flat surface exists)
     """
     bounds = mesh.bounds
     x_min, y_min, z_min = bounds[0]
     x_max, y_max, z_max = bounds[1]
+    normals = mesh.face_normals
 
     # X: center of mesh
     x_attach = (x_min + x_max) / 2
 
-    # Y: 70% from min toward max (toward "back" edge, away from center indent)
-    y_attach = y_min + 0.7 * (y_max - y_min)
+    # Filter threshold for above prongs
+    prong_threshold = z_min + 2.5
 
-    # Z: fixed height above mesh bottom (on main body, above prongs)
-    # Use RUNNER_Z_HEIGHT as the offset from bottom
+    # Find back faces (+Y normal)
+    back_mask = normals[:, 1] > 0.9
+
+    if back_mask.any():
+        back_face_indices = np.where(back_mask)[0]
+        back_faces = mesh.faces[back_face_indices]
+        back_verts = mesh.vertices[back_faces.flatten()]
+
+        # Filter to vertices above prongs
+        back_above_prongs = back_verts[back_verts[:, 2] > prong_threshold]
+
+        if len(back_above_prongs) > 0:
+            # Z: Use minimum Z of back face above prongs
+            z_attach = np.min(back_above_prongs[:, 2])
+
+            # Find side faces (±X normal) at the runner Z level
+            left_mask = normals[:, 0] < -0.9
+            right_mask = normals[:, 0] > 0.9
+            side_mask = left_mask | right_mask
+
+            # Get max Y extent where side faces exist at the runner Z level
+            side_y_max = y_max  # Default to mesh bound
+            if side_mask.any():
+                side_verts = mesh.vertices[mesh.faces[np.where(side_mask)[0]].flatten()]
+                z_tolerance = RUNNER_THICKNESS + 1.0
+                side_at_z = side_verts[
+                    (side_verts[:, 2] >= z_attach - 0.5) &
+                    (side_verts[:, 2] <= z_attach + z_tolerance)
+                ]
+                if len(side_at_z) > 0:
+                    side_y_max = np.max(side_at_z[:, 1])
+
+            # Find top surface (+Z normal) Y extent
+            # This prevents placing runner in back indent areas with no top
+            top_mask = normals[:, 2] > 0.9
+            top_y_max = y_max  # Default to mesh bound
+            if top_mask.any():
+                top_verts = mesh.vertices[mesh.faces[np.where(top_mask)[0]].flatten()]
+                top_above_prongs = top_verts[top_verts[:, 2] > prong_threshold]
+                if len(top_above_prongs) > 0:
+                    top_y_max = np.max(top_above_prongs[:, 1])
+
+            # Back face max Y
+            back_y_max = np.max(back_above_prongs[:, 1])
+
+            # Y attachment: use the MINIMUM of all three constraints
+            # This ensures runner is on solid material with top surface above it
+            effective_y_max = min(back_y_max, side_y_max, top_y_max)
+
+            # Offset inward by RUNNER_WIDTH/2 so runner doesn't extend past
+            y_attach = effective_y_max - RUNNER_WIDTH / 2
+
+            return (x_attach, y_attach, z_attach)
+
+    # Fallback to bounding box estimation if back face analysis fails
+    y_attach = y_max - 1.0  # 1mm inside back edge
     z_attach = z_min + RUNNER_Z_HEIGHT
 
     return (x_attach, y_attach, z_attach)
@@ -147,9 +203,19 @@ def arrange_parts_in_grid(meshes, rows=2, cols=5):
     cell_width = max_dims[0] + PART_SPACING
     cell_height = max_dims[1] + PART_SPACING
 
-    # Use a fixed Z height for all runners (RUNNER_Z_HEIGHT above final mesh bottom)
-    # We'll position parts so their bottoms are at Z=0, then attachment is at RUNNER_Z_HEIGHT
-    common_z = RUNNER_Z_HEIGHT
+    # First pass: find attachment points for all meshes to determine common Z
+    # Each mesh has its own optimal Z based on where its back face starts
+    local_attachments = []
+    for mesh in meshes:
+        local_x, local_y, local_z = find_attachment_point_local(mesh)
+        z_min = mesh.bounds[0][2]
+        # The attachment Z relative to mesh bottom
+        relative_z = local_z - z_min
+        local_attachments.append((local_x, local_y, local_z, z_min, relative_z))
+
+    # Use the MAXIMUM relative Z as common_z so all runners are at a valid height
+    # This ensures no runner is below any part's back face
+    common_z = max(att[4] for att in local_attachments)
 
     arranged = []
     attachment_positions = []
@@ -163,20 +229,16 @@ def arrange_parts_in_grid(meshes, rows=2, cols=5):
         target_y = row * cell_height
         target_z = common_z
 
-        # Find attachment point in mesh's local coordinates
-        local_x, local_y, local_z = find_attachment_point_local(mesh)
-
-        # Get mesh bounds for Z floor calculation
-        z_min = mesh.bounds[0][2]
+        local_x, local_y, local_z, z_min, relative_z = local_attachments[i]
 
         # Calculate translation:
         # - X and Y: move local attachment point to target grid position
-        # - Z: place mesh bottom at Z=0, so attachment point (at z_min + RUNNER_Z_HEIGHT)
-        #      ends up at RUNNER_Z_HEIGHT = common_z
+        # - Z: place mesh so its attachment point (at relative_z from bottom)
+        #      ends up at common_z
         translation = (
             target_x - local_x,
             target_y - local_y,
-            -z_min  # This puts mesh bottom at Z=0, attachment at RUNNER_Z_HEIGHT
+            common_z - relative_z - z_min  # Aligns attachment to common_z
         )
 
         # Apply single translation
