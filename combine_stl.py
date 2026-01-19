@@ -4,6 +4,7 @@ Script to combine multiple STL files into batches of 10 connected parts for JLC3
 Each batch has parts arranged in a 2x5 grid with 1.5mm thick connecting runners.
 """
 
+import json
 import trimesh
 import numpy as np
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 # Configuration
 STL_DIR = Path("Adapter STL files")
 OUTPUT_DIR = Path("Combined STL files")
+OFFSETS_FILE = Path("part_offsets.json")
 RUNNER_THICKNESS = 1.5  # mm - minimum for easy break-off per JLC3DP guidelines
 RUNNER_WIDTH = 2.0  # mm
 PART_SPACING = 5.0  # mm gap between parts
@@ -44,6 +46,19 @@ BATCHES = {
         ("Middle_1.stl", 4),
     ],
 }
+
+
+def load_offsets():
+    """Load part offsets from JSON file. Returns empty dict if file doesn't exist."""
+    if OFFSETS_FILE.exists():
+        with open(OFFSETS_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def get_offset(offsets, part_name):
+    """Get offset for a part, defaulting to zeros."""
+    return offsets.get(part_name, {'x': 0.0, 'y': 0.0, 'z': 0.0})
 
 
 def load_stl(filename):
@@ -172,7 +187,7 @@ def get_mesh_dimensions(mesh):
     return bounds[1] - bounds[0]  # max - min for each axis
 
 
-def arrange_parts_in_grid(meshes, rows=2, cols=5):
+def arrange_parts_in_grid(meshes, part_names=None, offsets=None, rows=2, cols=5):
     """
     Arrange meshes in a grid pattern so their attachment points land on a regular grid.
 
@@ -181,6 +196,8 @@ def arrange_parts_in_grid(meshes, rows=2, cols=5):
 
     Args:
         meshes: List of meshes to arrange
+        part_names: List of part names (for offset lookup), or None for no offsets
+        offsets: Dict of part offsets from load_offsets(), or None for no offsets
         rows: Number of rows in grid
         cols: Number of columns in grid
 
@@ -206,12 +223,21 @@ def arrange_parts_in_grid(meshes, rows=2, cols=5):
     # First pass: find attachment points for all meshes to determine common Z
     # Each mesh has its own optimal Z based on where its back face starts
     local_attachments = []
-    for mesh in meshes:
+    for i, mesh in enumerate(meshes):
         local_x, local_y, local_z = find_attachment_point_local(mesh)
         z_min = mesh.bounds[0][2]
         # The attachment Z relative to mesh bottom
         relative_z = local_z - z_min
-        local_attachments.append((local_x, local_y, local_z, z_min, relative_z))
+
+        # Apply X/Y offsets to local attachment point
+        z_offset = 0.0
+        if part_names and offsets:
+            offset = get_offset(offsets, part_names[i])
+            local_x += offset['x']
+            local_y += offset['y']
+            z_offset = offset['z']
+
+        local_attachments.append((local_x, local_y, local_z, z_min, relative_z, z_offset))
 
     # Use the MAXIMUM relative Z as common_z so all runners are at a valid height
     # This ensures no runner is below any part's back face
@@ -229,16 +255,16 @@ def arrange_parts_in_grid(meshes, rows=2, cols=5):
         target_y = row * cell_height
         target_z = common_z
 
-        local_x, local_y, local_z, z_min, relative_z = local_attachments[i]
+        local_x, local_y, local_z, z_min, relative_z, z_offset = local_attachments[i]
 
         # Calculate translation:
         # - X and Y: move local attachment point to target grid position
         # - Z: place mesh so its attachment point (at relative_z from bottom)
-        #      ends up at common_z
+        #      ends up at common_z, plus any Z offset
         translation = (
             target_x - local_x,
             target_y - local_y,
-            common_z - relative_z - z_min  # Aligns attachment to common_z
+            common_z - relative_z - z_min + z_offset
         )
 
         # Apply single translation
@@ -251,19 +277,23 @@ def arrange_parts_in_grid(meshes, rows=2, cols=5):
     return arranged, attachment_positions, (cell_width, cell_height), common_z
 
 
-def create_connected_batch(meshes):
+def create_connected_batch(meshes, part_names=None, offsets=None):
     """
     Create a single connected mesh from multiple meshes.
     Arranges parts in a grid and connects them with runners at their attachment points.
 
     Args:
         meshes: List of meshes to arrange and connect
+        part_names: List of part names (for offset lookup), or None for no offsets
+        offsets: Dict of part offsets from load_offsets(), or None for no offsets
     """
     if len(meshes) == 0:
         raise ValueError("No meshes to combine")
 
     # Arrange parts in grid - each part's attachment point lands on the grid
-    arranged, attachment_positions, cell_size, common_z = arrange_parts_in_grid(meshes)
+    arranged, attachment_positions, cell_size, common_z = arrange_parts_in_grid(
+        meshes, part_names=part_names, offsets=offsets
+    )
     print(f"  Using runner Z height: {common_z:.2f}mm")
 
     # Create runners connecting attachment points
@@ -293,25 +323,29 @@ def create_connected_batch(meshes):
     return combined
 
 
-def process_batch(batch_name, part_specs):
+def process_batch(batch_name, part_specs, offsets=None):
     """
     Process a single batch: load parts, combine, and save.
     part_specs is a list of (filename, count) tuples.
+    offsets is a dict of part offsets from load_offsets(), or None for no offsets.
     """
     print(f"\nProcessing {batch_name}...")
 
-    # Load all required meshes
+    # Load all required meshes and track part names
     meshes = []
+    part_names = []
     for filename, count in part_specs:
         print(f"  Loading {count}x {filename}")
+        part_name = filename.replace('.stl', '')
         base_mesh = load_stl(filename)
         for _ in range(count):
             meshes.append(base_mesh.copy())
+            part_names.append(part_name)
 
     print(f"  Total parts: {len(meshes)}")
 
-    # Combine meshes with runners
-    combined = create_connected_batch(meshes)
+    # Combine meshes with runners (applying offsets if provided)
+    combined = create_connected_batch(meshes, part_names=part_names, offsets=offsets)
 
     # Save combined mesh
     output_path = OUTPUT_DIR / f"{batch_name}.stl"
@@ -326,35 +360,40 @@ def main():
     print("=" * 60)
     print("STL Combiner for JLC3DP Connected Parts")
     print("=" * 60)
-    
+
     # Create output directory
     OUTPUT_DIR.mkdir(exist_ok=True)
     print(f"\nOutput directory: {OUTPUT_DIR}")
-    
+
+    # Load offsets if available
+    offsets = load_offsets()
+    if offsets:
+        print(f"\nLoaded offsets for {len(offsets)} part types from {OFFSETS_FILE}")
+
     # Verify all source files exist
     print("\nVerifying source files...")
     all_files = set()
     for part_specs in BATCHES.values():
         for filename, _ in part_specs:
             all_files.add(filename)
-    
+
     missing = []
     for filename in all_files:
         if not (STL_DIR / filename).exists():
             missing.append(filename)
-    
+
     if missing:
         print("ERROR: Missing STL files:")
         for f in missing:
             print(f"  - {f}")
         return 1
-    
+
     print(f"  All {len(all_files)} source files found!")
-    
+
     # Process each batch
     total_parts = 0
     for batch_name, part_specs in BATCHES.items():
-        process_batch(batch_name, part_specs)
+        process_batch(batch_name, part_specs, offsets=offsets)
         total_parts += sum(count for _, count in part_specs)
     
     print("\n" + "=" * 60)
